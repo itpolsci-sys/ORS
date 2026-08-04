@@ -1,0 +1,247 @@
+const GOOGLE_CLIENT_ID = 'PASTE_YOUR_GOOGLE_OAUTH_CLIENT_ID.apps.googleusercontent.com';
+
+const SHEET_NAME = 'Tickets';
+const USERS_SHEET_NAME = 'Users';
+const PHOTO_FOLDER_NAME = 'RepairSystemPhotos';
+
+const COLUMNS = [
+  'id', 'name', 'phone', 'reporterType', 'area', 'floor', 'room', 'asset',
+  'foundDate', 'category', 'detail', 'urgency', 'photo', 'status',
+  'assignee', 'note', 'createdAt', 'historyJson'
+];
+
+const USER_COLUMNS = ['email', 'displayName', 'role'];
+
+function getSheet_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(SHEET_NAME);
+  }
+  ensureHeader_(sheet, COLUMNS);
+  return sheet;
+}
+
+function ensureHeader_(sheet, columns) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    const firstCell = sheet.getRange(1, 1).getValue();
+    if (firstCell !== columns[0]) {
+      sheet.getRange(1, 1, 1, columns.length).setValues([columns]);
+    }
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function getUsersSheet_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(USERS_SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(USERS_SHEET_NAME);
+  }
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    const firstCell = sheet.getRange(1, 1).getValue();
+    if (firstCell !== USER_COLUMNS[0]) {
+      sheet.getRange(1, 1, 1, USER_COLUMNS.length).setValues([USER_COLUMNS]);
+      // แถวตัวอย่าง แก้ไข/ลบ/เพิ่มเจ้าหน้าที่เองได้โดยตรงในชีตนี้ (ใส่อีเมล Google จริงของเจ้าหน้าที่)
+      sheet.appendRow(['[email protected]', 'ผู้ดูแลระบบ', 'admin']);
+      sheet.appendRow(['[email protected]', 'ช่างอาคาร สมชาย', 'staff']);
+    }
+  } finally {
+    lock.releaseLock();
+  }
+  return sheet;
+}
+
+function rowToTicket_(row) {
+  const obj = {};
+  COLUMNS.forEach((col, i) => { obj[col] = row[i]; });
+  try {
+    obj.history = obj.historyJson ? JSON.parse(obj.historyJson) : [];
+  } catch (e) {
+    obj.history = [];
+  }
+  delete obj.historyJson;
+  return obj;
+}
+
+function ticketToRow_(t) {
+  return COLUMNS.map(col => {
+    if (col === 'historyJson') return JSON.stringify(t.history || []);
+    return t[col] !== undefined && t[col] !== null ? t[col] : '';
+  });
+}
+
+function nextId_(sheet) {
+  const lastRow = sheet.getLastRow();
+  return 'RQ-' + (1000 + lastRow);
+}
+
+function savePhotoToDrive_(base64DataUrl, ticketId) {
+  if (!base64DataUrl || base64DataUrl.indexOf('data:image') !== 0) return base64DataUrl || '';
+  const match = base64DataUrl.match(/^data:(image\/\w+);base64,(.*)$/);
+  if (!match) return '';
+  const mimeType = match[1];
+  const base64Data = match[2];
+  const bytes = Utilities.base64Decode(base64Data);
+  const blob = Utilities.newBlob(bytes, mimeType, ticketId + '.jpg');
+
+  const folders = DriveApp.getFoldersByName(PHOTO_FOLDER_NAME);
+  const folder = folders.hasNext() ? folders.next() : DriveApp.createFolder(PHOTO_FOLDER_NAME);
+
+  const file = folder.createFile(blob);
+  file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+  return 'https://drive.google.com/uc?id=' + file.getId();
+}
+
+function doGet(e) {
+  const type = (e && e.parameter) ? e.parameter.type : undefined;
+
+  if (type === 'staff') {
+    const usersSheet = getUsersSheet_();
+    const data = usersSheet.getDataRange().getValues();
+    data.shift();
+    const staff = data
+      .filter(row => row[0])
+      .map(row => ({ email: row[0], displayName: row[1], role: row[2] }));
+    return ContentService
+      .createTextOutput(JSON.stringify({ staff }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+
+  const sheet = getSheet_();
+  const data = sheet.getDataRange().getValues();
+  data.shift();
+  const tickets = data
+    .filter(row => row[0])
+    .map(rowToTicket_);
+  return ContentService
+    .createTextOutput(JSON.stringify({ tickets }))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function doPost(e) {
+  if (!e || !e.postData) {
+    return ContentService
+      .createTextOutput(JSON.stringify({ error: 'ฟังก์ชันนี้ต้องเรียกผ่าน URL ของเว็บแอปที่ deploy ไว้ ไม่ใช่กด Run ในหน้า editor' }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+  const body = JSON.parse(e.postData.contents);
+  const sheet = getSheet_();
+  let result;
+
+  if (body.action === 'create') {
+    result = createTicket_(sheet, body.ticket || {});
+  } else if (body.action === 'update') {
+    result = updateTicket_(sheet, body.id, body.fields || {});
+  } else if (body.action === 'delete') {
+    result = deleteTicket_(sheet, body.id);
+  } else if (body.action === 'google-login') {
+    result = googleLogin_(body.idToken);
+  } else {
+    result = { error: 'unknown action' };
+  }
+
+  return ContentService
+    .createTextOutput(JSON.stringify(result))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function createTicket_(sheet, ticket) {
+  const id = nextId_(sheet);
+  const now = new Date().toLocaleString('th-TH');
+
+  const photoUrl = savePhotoToDrive_(ticket.photo, id);
+
+  const fullTicket = {
+    id: id,
+    name: ticket.name || '',
+    phone: ticket.phone || '',
+    reporterType: ticket.reporterType || '',
+    area: ticket.area || '',
+    floor: ticket.floor || '',
+    room: ticket.room || '',
+    asset: ticket.asset || '',
+    foundDate: ticket.foundDate || '',
+    category: ticket.category || '',
+    detail: ticket.detail || '',
+    urgency: ticket.urgency || '',
+    photo: photoUrl,
+    status: 'รับเรื่อง',
+    assignee: '',
+    note: '',
+    createdAt: now,
+    history: [{ status: 'รับเรื่อง', time: now }]
+  };
+
+  sheet.appendRow(ticketToRow_(fullTicket));
+  return fullTicket;
+}
+
+function findRowIndexById_(sheet, id) {
+  const data = sheet.getDataRange().getValues();
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][0] === id) return i + 1;
+  }
+  return -1;
+}
+
+function updateTicket_(sheet, id, fields) {
+  const rowIndex = findRowIndexById_(sheet, id);
+  if (rowIndex === -1) return { error: 'not found' };
+
+  const rowValues = sheet.getRange(rowIndex, 1, 1, COLUMNS.length).getValues()[0];
+  const ticket = rowToTicket_(rowValues);
+
+  const now = new Date().toLocaleString('th-TH');
+  if (fields.status !== undefined && fields.status !== ticket.status) {
+    ticket.status = fields.status;
+    ticket.history.push({ status: fields.status, time: now });
+  }
+  if (fields.assignee !== undefined) ticket.assignee = fields.assignee;
+  if (fields.note !== undefined) ticket.note = fields.note;
+
+  sheet.getRange(rowIndex, 1, 1, COLUMNS.length).setValues([ticketToRow_(ticket)]);
+  return ticket;
+}
+
+function googleLogin_(idToken) {
+  if (!idToken) return { success: false, error: 'ไม่พบข้อมูลการเข้าสู่ระบบ' };
+
+  let payload;
+  try {
+    const res = UrlFetchApp.fetch('https://oauth2.googleapis.com/tokeninfo?id_token=' + encodeURIComponent(idToken));
+    payload = JSON.parse(res.getContentText());
+  } catch (e) {
+    return { success: false, error: 'ตรวจสอบบัญชี Google ไม่สำเร็จ' };
+  }
+
+  if (payload.aud !== GOOGLE_CLIENT_ID) {
+    return { success: false, error: 'Client ID ไม่ตรงกัน (ตรวจสอบ GOOGLE_CLIENT_ID ในสคริปต์และในหน้าเว็บว่าเป็นตัวเดียวกัน)' };
+  }
+  if (payload.email_verified !== 'true' && payload.email_verified !== true) {
+    return { success: false, error: 'อีเมลนี้ยังไม่ได้ยืนยันกับ Google' };
+  }
+
+  const email = payload.email;
+  const usersSheet = getUsersSheet_();
+  const data = usersSheet.getDataRange().getValues();
+  data.shift();
+  for (let i = 0; i < data.length; i++) {
+    if (data[i][0] === email) {
+      return { success: true, email: email, displayName: data[i][1], role: data[i][2] };
+    }
+  }
+  return { success: false, error: 'อีเมล ' + email + ' ไม่มีสิทธิ์เข้าใช้งานระบบ (เพิ่มอีเมลนี้ในชีต Users ก่อน)' };
+}
+
+function deleteTicket_(sheet, id) {
+  const rowIndex = findRowIndexById_(sheet, id);
+  if (rowIndex === -1) return { error: 'not found' };
+  sheet.deleteRow(rowIndex);
+  return { deleted: true, id: id };
+}
